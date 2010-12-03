@@ -74,6 +74,10 @@ typedef struct {
 
     ngx_uint_t                     headers_hash_max_size;
     ngx_uint_t                     headers_hash_bucket_size;
+    
+    ngx_uint_t                     ssl_protocols;
+    ngx_str_t                      ssl_client_certificate;
+    ngx_str_t                      ssl_client_certificate_key;
 } ngx_http_proxy_loc_conf_t;
 
 
@@ -178,6 +182,13 @@ static ngx_conf_bitmask_t  ngx_http_proxy_ignore_headers_masks[] = {
     { ngx_string("X-Accel-Expires"), NGX_HTTP_UPSTREAM_IGN_XA_EXPIRES },
     { ngx_string("Expires"), NGX_HTTP_UPSTREAM_IGN_EXPIRES },
     { ngx_string("Cache-Control"), NGX_HTTP_UPSTREAM_IGN_CACHE_CONTROL },
+    { ngx_null_string, 0 }
+};
+
+static ngx_conf_bitmask_t  ngx_http_proxy_ssl_protocols[] = {
+    { ngx_string("SSLv2"), NGX_SSL_SSLv2 },
+    { ngx_string("SSLv3"), NGX_SSL_SSLv3 },
+    { ngx_string("TLSv1"), NGX_SSL_TLSv1 },
     { ngx_null_string, 0 }
 };
 
@@ -465,6 +476,27 @@ static ngx_command_t  ngx_http_proxy_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_proxy_loc_conf_t, upstream.ssl_session_reuse),
       NULL },
+      
+    { ngx_string("proxy_ssl_client_certificate"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_proxy_loc_conf_t, ssl_client_certificate),
+      NULL },
+      
+    { ngx_string("proxy_ssl_client_certificate_key"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_proxy_loc_conf_t, ssl_client_certificate_key),
+      NULL },
+      
+    { ngx_string("proxy_ssl_protocols"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+      ngx_conf_set_bitmask_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_proxy_loc_conf_t, ssl_protocols),
+      &ngx_http_proxy_ssl_protocols },
 
 #endif
 
@@ -2016,6 +2048,12 @@ ngx_http_proxy_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_bufs_value(conf->upstream.bufs, prev->upstream.bufs,
                               8, ngx_pagesize);
 
+#if (NGX_HTTP_SSL)
+    if (ngx_http_proxy_set_ssl(cf, conf) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+#endif
+
     if (conf->upstream.bufs.num < 2) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "there must be at least 2 \"proxy_buffers\"");
@@ -2196,6 +2234,31 @@ ngx_http_proxy_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 #if (NGX_HTTP_SSL)
     ngx_conf_merge_value(conf->upstream.ssl_session_reuse,
                               prev->upstream.ssl_session_reuse, 1);
+			      
+    ngx_conf_merge_bitmask_value(conf->ssl_protocols, prev->ssl_protocols,
+                         (NGX_CONF_BITMASK_SET|NGX_SSL_SSLv3|NGX_SSL_TLSv1));
+    ngx_conf_merge_str_value(conf->ssl_client_certificate, 
+			     prev->ssl_client_certificate, "");
+    ngx_conf_merge_str_value(conf->ssl_client_certificate_key, 
+			     prev->ssl_client_certificate_key, "");
+    
+    if (conf->ssl_client_certificate.len == 0 && 
+		      conf->ssl_client_certificate_key.len != 0) {
+	ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                      "no \"proxy_ssl_client_certificate\" is defined "
+                      "for certificate key \"%V\"", 
+		      &conf->ssl_client_certificate_key);
+        return NGX_CONF_ERROR;
+    }
+    
+    if (conf->ssl_client_certificate.len != 0 && 
+		      conf->ssl_client_certificate_key.len == 0) { 
+        ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                      "no \"proxy_ssl_client_certificate_key\" is defined "
+                      "for certificate \"%V\"", &conf->ssl_client_certificate);
+        return NGX_CONF_ERROR;
+    }
+
 #endif
 
     ngx_conf_merge_value(conf->redirect, prev->redirect, 1);
@@ -2629,12 +2692,6 @@ ngx_http_proxy_pass(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             return NGX_CONF_ERROR;
         }
 
-#if (NGX_HTTP_SSL)
-        if (ngx_http_proxy_set_ssl(cf, plcf) != NGX_OK) {
-            return NGX_CONF_ERROR;
-        }
-#endif
-
         return NGX_CONF_OK;
     }
 
@@ -2645,10 +2702,6 @@ ngx_http_proxy_pass(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     } else if (ngx_strncasecmp(url->data, (u_char *) "https://", 8) == 0) {
 
 #if (NGX_HTTP_SSL)
-        if (ngx_http_proxy_set_ssl(cf, plcf) != NGX_OK) {
-            return NGX_CONF_ERROR;
-        }
-
         add = 8;
         port = 443;
 #else
@@ -3012,11 +3065,24 @@ ngx_http_proxy_set_ssl(ngx_conf_t *cf, ngx_http_proxy_loc_conf_t *plcf)
     plcf->upstream.ssl->log = cf->log;
 
     if (ngx_ssl_create(plcf->upstream.ssl,
-                       NGX_SSL_SSLv2|NGX_SSL_SSLv3|NGX_SSL_TLSv1, NULL)
+                       plcf->ssl_protocols, NULL)
         != NGX_OK)
     {
         return NGX_ERROR;
     }
+
+    if(plcf->ssl_client_certificate.len > 0 &&
+       plcf->ssl_client_certificate_key.len > 0) {
+        if (ngx_ssl_certificate(cf, plcf->upstream.ssl,
+                                &plcf->ssl_client_certificate,
+                                &plcf->ssl_client_certificate_key) != NGX_OK) {
+            return NGX_ERROR;
+        }
+    }
+
+    // right now we have no proper infrastructure to check server certificates
+    // so we force the info_callback to be NULL
+    SSL_CTX_set_info_callback(plcf->upstream.ssl->ctx, NULL);
 
     cln = ngx_pool_cleanup_add(cf->pool, 0);
     if (cln == NULL) {
